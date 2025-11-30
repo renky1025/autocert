@@ -189,6 +189,9 @@ func runScheduleList(cmd *cobra.Command, args []string) error {
 func renewDomainCert(domain string) error {
 	// 创建证书管理器
 	certManager := cert.NewManager(domain, "")
+	if certManager == nil {
+		return fmt.Errorf("创建证书管理器失败")
+	}
 
 	// 续期证书
 	if err := certManager.Renew(); err != nil {
@@ -211,6 +214,9 @@ func renewAllCerts() error {
 func showDomainStatus(domain string) error {
 	// 创建证书管理器
 	certManager := cert.NewManager(domain, "")
+	if certManager == nil {
+		return fmt.Errorf("创建证书管理器失败")
+	}
 
 	// 获取证书信息
 	certInfo, err := certManager.GetCertInfo()
@@ -220,9 +226,13 @@ func showDomainStatus(domain string) error {
 
 	// 显示证书状态
 	fmt.Printf("域名: %s\n", certInfo.Domain)
+	if len(certInfo.Domains) > 1 {
+		fmt.Printf("所有域名: %v\n", certInfo.Domains)
+	}
 	fmt.Printf("证书路径: %s\n", certInfo.CertPath)
 	fmt.Printf("私钥路径: %s\n", certInfo.KeyPath)
 	fmt.Printf("到期时间: %s\n", certInfo.ExpiryDate.Format("2006-01-02 15:04:05"))
+	fmt.Printf("剩余天数: %d 天\n", certInfo.DaysLeft)
 
 	if certInfo.IsValid {
 		fmt.Printf("状态: ✓ 有效\n")

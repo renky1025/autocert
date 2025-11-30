@@ -155,8 +155,8 @@ release: ## 一键发布（清理+构建+打包）
 quick-package: ## 快速打包（不清理不测试）
 	@echo "快速打包..."
 	@mkdir -p $(DIST_DIR)
-	@chmod +x scripts/build-release.sh
-	@scripts/build-release.sh $(VERSION)
+	@chmod +x scripts/package.sh
+	@scripts/package.sh $(VERSION) $(DIST_DIR) $(BINARY_NAME)
 
 deps: ## 安装开发依赖
 	@echo "安装开发依赖..."

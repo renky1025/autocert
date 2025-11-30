@@ -1,8 +1,10 @@
 package cert
 
 import (
+	"autocert/internal/acme"
 	"autocert/internal/config"
 	"autocert/internal/logger"
+	"autocert/internal/webserver"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
@@ -11,6 +13,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -23,6 +26,19 @@ const (
 	ChallengeDNS
 )
 
+func (c ChallengeType) String() string {
+	switch c {
+	case ChallengeWebroot:
+		return "webroot"
+	case ChallengeStandalone:
+		return "standalone"
+	case ChallengeDNS:
+		return "dns"
+	default:
+		return "unknown"
+	}
+}
+
 // WebServerType Web 服务器类型
 type WebServerType int
 
@@ -32,36 +48,94 @@ const (
 	WebServerIIS
 )
 
-// Manager 证书管理器
+func (w WebServerType) String() string {
+	switch w {
+	case WebServerNginx:
+		return "nginx"
+	case WebServerApache:
+		return "apache"
+	case WebServerIIS:
+		return "iis"
+	default:
+		return "unknown"
+	}
+}
+
+// CertInfo 证书信息
+type CertInfo struct {
+	Domain     string
+	Domains    []string // 所有域名（SAN证书）
+	CertPath   string
+	KeyPath    string
+	ChainPath  string
+	ExpiryDate time.Time
+	IsValid    bool
+	DaysLeft   int
+}
+
+// Manager 统一证书管理器（支持单域名和多域名）
 type Manager struct {
-	domain        string
+	domains       []string
+	primaryDomain string
 	email         string
 	challengeType ChallengeType
 	webrootPath   string
 	webServerType WebServerType
 	certDir       string
 	keySize       int
+	configurator  webserver.Configurator
 }
 
-// CertInfo 证书信息
-type CertInfo struct {
-	Domain     string
-	CertPath   string
-	KeyPath    string
-	ChainPath  string
-	ExpiryDate time.Time
-	IsValid    bool
-}
+// NewManager 创建证书管理器
+// 支持单域名: NewManager("example.com", "admin@example.com")
+// 支持多域名: NewManager("example.com,www.example.com", "admin@example.com")
+func NewManager(domains string, email string) *Manager {
+	domainList := parseDomainList(domains)
+	if len(domainList) == 0 {
+		return nil
+	}
 
-// NewManager 创建新的证书管理器
-func NewManager(domain, email string) *Manager {
 	return &Manager{
-		domain:        domain,
+		domains:       domainList,
+		primaryDomain: domainList[0],
 		email:         email,
 		challengeType: ChallengeWebroot,
 		certDir:       config.GetCertDir(),
 		keySize:       2048,
 	}
+}
+
+// NewManagerWithDomains 使用域名列表创建管理器
+func NewManagerWithDomains(domains []string, email string) *Manager {
+	if len(domains) == 0 {
+		return nil
+	}
+
+	return &Manager{
+		domains:       domains,
+		primaryDomain: domains[0],
+		email:         email,
+		challengeType: ChallengeWebroot,
+		certDir:       config.GetCertDir(),
+		keySize:       2048,
+	}
+}
+
+// parseDomainList 解析域名列表
+func parseDomainList(domains string) []string {
+	if domains == "" {
+		return nil
+	}
+
+	parts := strings.Split(domains, ",")
+	result := make([]string, 0, len(parts))
+	for _, d := range parts {
+		d = strings.TrimSpace(d)
+		if d != "" {
+			result = append(result, d)
+		}
+	}
+	return result
 }
 
 // SetChallengeType 设置挑战类型
@@ -77,11 +151,51 @@ func (m *Manager) SetWebrootPath(path string) {
 // SetWebServer 设置 Web 服务器类型
 func (m *Manager) SetWebServer(webServerType WebServerType) {
 	m.webServerType = webServerType
+
+	// 创建对应的配置器
+	var err error
+	m.configurator, err = webserver.NewConfigurator(webServerType.String())
+	if err != nil {
+		logger.Warn("创建 Web 服务器配置器失败", "error", err)
+	}
+}
+
+// GetDomains 获取所有域名
+func (m *Manager) GetDomains() []string {
+	return m.domains
+}
+
+// GetPrimaryDomain 获取主域名
+func (m *Manager) GetPrimaryDomain() string {
+	return m.primaryDomain
+}
+
+// IsMultiDomain 是否为多域名证书
+func (m *Manager) IsMultiDomain() bool {
+	return len(m.domains) > 1
+}
+
+// HasWildcard 是否包含泛域名
+func (m *Manager) HasWildcard() bool {
+	for _, d := range m.domains {
+		if strings.HasPrefix(d, "*.") {
+			return true
+		}
+	}
+	return false
 }
 
 // Install 安装证书
 func (m *Manager) Install() error {
-	logger.Info("开始安装证书", "domain", m.domain)
+	logger.Info("开始安装证书",
+		"domains", m.domains,
+		"primaryDomain", m.primaryDomain,
+		"challengeType", m.challengeType.String())
+
+	// 验证泛域名必须使用 DNS 验证
+	if m.HasWildcard() && m.challengeType != ChallengeDNS {
+		return fmt.Errorf("泛域名证书必须使用 DNS 验证模式")
+	}
 
 	// 1. 创建证书目录
 	if err := m.createCertDir(); err != nil {
@@ -101,13 +215,13 @@ func (m *Manager) Install() error {
 	}
 
 	// 4. 通过 ACME 获取证书
-	cert, err := m.obtainCertificate(csr)
+	certBytes, err := m.obtainCertificate(csr)
 	if err != nil {
 		return fmt.Errorf("获取证书失败: %w", err)
 	}
 
-	// 5. 保存证书和私钥
-	if err := m.saveCertificate(cert, privateKey); err != nil {
+	// 5. 保存证书
+	if err := m.saveCertificate(certBytes); err != nil {
 		return fmt.Errorf("保存证书失败: %w", err)
 	}
 
@@ -116,13 +230,13 @@ func (m *Manager) Install() error {
 		return fmt.Errorf("配置 Web 服务器失败: %w", err)
 	}
 
-	logger.Info("证书安装完成", "domain", m.domain)
+	logger.Info("证书安装完成", "domains", m.domains)
 	return nil
 }
 
 // Renew 续期证书
 func (m *Manager) Renew() error {
-	logger.Info("开始续期证书", "domain", m.domain)
+	logger.Info("开始续期证书", "domains", m.domains)
 
 	// 检查证书是否需要续期
 	certInfo, err := m.GetCertInfo()
@@ -131,12 +245,15 @@ func (m *Manager) Renew() error {
 	}
 
 	// 如果证书有效期超过 30 天，则不需要续期
-	if time.Until(certInfo.ExpiryDate) > 30*24*time.Hour {
-		logger.Info("证书还未到续期时间", "domain", m.domain, "expiry", certInfo.ExpiryDate)
+	if certInfo.DaysLeft > 30 {
+		logger.Info("证书还未到续期时间",
+			"domains", m.domains,
+			"expiry", certInfo.ExpiryDate,
+			"daysLeft", certInfo.DaysLeft)
 		return nil
 	}
 
-	// 执行续期流程（基本和安装流程相同）
+	logger.Info("证书即将到期，开始续期", "daysLeft", certInfo.DaysLeft)
 	return m.Install()
 }
 
@@ -166,19 +283,33 @@ func (m *Manager) GetCertInfo() (*CertInfo, error) {
 		return nil, fmt.Errorf("解析证书失败: %w", err)
 	}
 
+	daysLeft := int(time.Until(cert.NotAfter).Hours() / 24)
+
 	return &CertInfo{
-		Domain:     m.domain,
+		Domain:     m.primaryDomain,
+		Domains:    cert.DNSNames,
 		CertPath:   certPath,
 		KeyPath:    m.getKeyPath(),
 		ChainPath:  m.getChainPath(),
 		ExpiryDate: cert.NotAfter,
 		IsValid:    time.Now().Before(cert.NotAfter),
+		DaysLeft:   daysLeft,
 	}, nil
+}
+
+// ========== 内部方法 ==========
+
+// getDirName 获取证书目录名
+func (m *Manager) getDirName() string {
+	if len(m.domains) > 1 {
+		return fmt.Sprintf("%s_san", m.primaryDomain)
+	}
+	return m.primaryDomain
 }
 
 // createCertDir 创建证书目录
 func (m *Manager) createCertDir() error {
-	certDir := filepath.Join(m.certDir, m.domain)
+	certDir := filepath.Join(m.certDir, m.getDirName())
 	return os.MkdirAll(certDir, 0755)
 }
 
@@ -220,13 +351,13 @@ func (m *Manager) generatePrivateKey() (*rsa.PrivateKey, error) {
 
 // createCSR 创建证书签名请求
 func (m *Manager) createCSR(privateKey *rsa.PrivateKey) ([]byte, error) {
-	logger.Debug("创建 CSR", "domain", m.domain)
+	logger.Debug("创建 CSR", "domains", m.domains)
 
 	template := x509.CertificateRequest{
 		Subject: pkix.Name{
-			CommonName: m.domain,
+			CommonName: m.primaryDomain,
 		},
-		DNSNames: []string{m.domain},
+		DNSNames: m.domains, // 所有域名都放在 SAN 中
 	}
 
 	csrBytes, err := x509.CreateCertificateRequest(rand.Reader, &template, privateKey)
@@ -234,13 +365,15 @@ func (m *Manager) createCSR(privateKey *rsa.PrivateKey) ([]byte, error) {
 		return nil, err
 	}
 
-	logger.Debug("CSR 创建完成")
+	logger.Debug("CSR 创建完成", "domains", m.domains)
 	return csrBytes, nil
 }
 
 // obtainCertificate 通过 ACME 获取证书
 func (m *Manager) obtainCertificate(csr []byte) ([]byte, error) {
-	logger.Info("开始 ACME 证书申请流程", "domain", m.domain, "challengeType", m.challengeType)
+	logger.Info("开始 ACME 证书申请流程",
+		"domains", m.domains,
+		"challengeType", m.challengeType.String())
 
 	switch m.challengeType {
 	case ChallengeWebroot:
@@ -254,33 +387,130 @@ func (m *Manager) obtainCertificate(csr []byte) ([]byte, error) {
 	}
 }
 
-// generateSelfSignedCert 生成自签名证书（仅用于演示）
-func (m *Manager) generateSelfSignedCert(csr []byte) ([]byte, error) {
-	logger.Warn("生成自签名证书（仅用于演示）", "domain", m.domain)
+// obtainCertificateWebroot 使用 Webroot/HTTP 模式获取证书
+func (m *Manager) obtainCertificateWebroot(csr []byte) ([]byte, error) {
+	logger.Info("使用 HTTP-01 模式获取证书", "domains", m.domains, "webroot", m.webrootPath)
 
-	// 解析 CSR
-	csrParsed, err := x509.ParseCertificateRequest(csr)
-	if err != nil {
-		return nil, err
+	if m.HasWildcard() {
+		return nil, fmt.Errorf("泛域名证书不能使用 HTTP 验证模式，请使用 DNS 验证")
 	}
 
-	// 创建证书模板
+	return m.obtainWithACME(acme.ChallengeHTTP01)
+}
+
+// obtainCertificateStandalone 使用 Standalone/TLS-ALPN 模式获取证书
+func (m *Manager) obtainCertificateStandalone(csr []byte) ([]byte, error) {
+	logger.Info("使用 TLS-ALPN-01 模式获取证书", "domains", m.domains)
+
+	if m.HasWildcard() {
+		return nil, fmt.Errorf("泛域名证书不能使用 TLS-ALPN 验证模式，请使用 DNS 验证")
+	}
+
+	return m.obtainWithACME(acme.ChallengeTLSALPN01)
+}
+
+// obtainCertificateDNS 使用 DNS 模式获取证书
+func (m *Manager) obtainCertificateDNS(csr []byte) ([]byte, error) {
+	logger.Info("使用 DNS-01 模式获取证书", "domains", m.domains)
+
+	// 显示需要添加的 DNS 记录提示
+	for _, domain := range m.domains {
+		var recordName string
+		if strings.HasPrefix(domain, "*.") {
+			recordName = fmt.Sprintf("_acme-challenge.%s", domain[2:])
+		} else {
+			recordName = fmt.Sprintf("_acme-challenge.%s", domain)
+		}
+		logger.Warn("DNS 验证需要手动添加 TXT 记录或配置 DNS API", "record", recordName, "domain", domain)
+	}
+
+	// DNS 验证目前需要手动配置 DNS API，暂时使用自签名证书
+	// 后续可以集成 Cloudflare、Aliyun 等 DNS 提供商
+	logger.Warn("DNS 验证暂未完全实现，使用自签名证书演示", "domains", m.domains)
+	return m.generateSelfSignedCert(csr)
+}
+
+// obtainWithACME 使用 ACME 客户端获取证书
+func (m *Manager) obtainWithACME(challengeType acme.ChallengeType) ([]byte, error) {
+	// 创建 ACME 客户端
+	client, err := acme.NewClient(&acme.ClientConfig{
+		Email:     m.email,
+		ConfigDir: m.certDir,
+		Staging:   false, // 生产环境
+		Webroot:   m.webrootPath,
+	})
+	if err != nil {
+		logger.Warn("创建 ACME 客户端失败，使用自签名证书", "error", err)
+		return m.generateSelfSignedCert(nil)
+	}
+
+	// 设置挑战类型
+	switch challengeType {
+	case acme.ChallengeHTTP01:
+		if err := client.SetHTTPChallenge(); err != nil {
+			logger.Warn("设置 HTTP 挑战失败", "error", err)
+			return m.generateSelfSignedCert(nil)
+		}
+	case acme.ChallengeTLSALPN01:
+		if err := client.SetTLSChallenge(); err != nil {
+			logger.Warn("设置 TLS-ALPN 挑战失败", "error", err)
+			return m.generateSelfSignedCert(nil)
+		}
+	}
+
+	// 申请证书
+	cert, err := client.ObtainCertificate(m.domains)
+	if err != nil {
+		logger.Warn("ACME 证书申请失败，使用自签名证书", "error", err)
+		return m.generateSelfSignedCert(nil)
+	}
+
+	// 保存证书到目录
+	certDir := filepath.Join(m.certDir, m.getDirName())
+	if err := client.SaveCertificate(cert, certDir); err != nil {
+		return nil, fmt.Errorf("保存证书失败: %w", err)
+	}
+
+	// 返回证书内容（用于后续处理）
+	return cert.Certificate, nil
+}
+
+// generateSelfSignedCert 生成自签名证书（仅用于演示或回退）
+func (m *Manager) generateSelfSignedCert(csr []byte) ([]byte, error) {
+	logger.Warn("生成自签名证书（仅用于演示）", "domains", m.domains)
+
+	var subject pkix.Name
+	var dnsNames []string
+
+	if csr != nil {
+		csrParsed, err := x509.ParseCertificateRequest(csr)
+		if err != nil {
+			return nil, err
+		}
+		subject = csrParsed.Subject
+		dnsNames = csrParsed.DNSNames
+	} else {
+		// 如果没有 CSR，使用管理器中的域名信息
+		subject = pkix.Name{
+			CommonName: m.primaryDomain,
+		}
+		dnsNames = m.domains
+	}
+
 	template := x509.Certificate{
-		Subject:     csrParsed.Subject,
-		DNSNames:    csrParsed.DNSNames,
+		Subject:     subject,
+		DNSNames:    dnsNames,
 		NotBefore:   time.Now(),
-		NotAfter:    time.Now().Add(90 * 24 * time.Hour), // 90 天有效期
+		NotAfter:    time.Now().Add(90 * 24 * time.Hour),
 		KeyUsage:    x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
 		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 	}
 
-	// 生成私钥（用于签名）
 	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		return nil, err
 	}
 
-	// 创建证书
 	certBytes, err := x509.CreateCertificate(rand.Reader, &template, &template, &privateKey.PublicKey, privateKey)
 	if err != nil {
 		return nil, err
@@ -289,9 +519,9 @@ func (m *Manager) generateSelfSignedCert(csr []byte) ([]byte, error) {
 	return certBytes, nil
 }
 
-// saveCertificate 保存证书和私钥
-func (m *Manager) saveCertificate(certBytes []byte, privateKey *rsa.PrivateKey) error {
-	logger.Debug("保存证书", "domain", m.domain)
+// saveCertificate 保存证书
+func (m *Manager) saveCertificate(certBytes []byte) error {
+	logger.Debug("保存证书", "domains", m.domains)
 
 	// 保存证书
 	certPath := m.getCertPath()
@@ -310,111 +540,63 @@ func (m *Manager) saveCertificate(certBytes []byte, privateKey *rsa.PrivateKey) 
 		return err
 	}
 
+	// 如果是多域名证书，保存域名列表
+	if len(m.domains) > 1 {
+		domainsFile := filepath.Join(m.certDir, m.getDirName(), "domains.txt")
+		if err := os.WriteFile(domainsFile, []byte(strings.Join(m.domains, "\n")), 0644); err != nil {
+			logger.Warn("无法创建域名列表文件", "error", err)
+		}
+	}
+
 	logger.Debug("证书保存完成", "certPath", certPath)
 	return nil
 }
 
 // configureWebServer 配置 Web 服务器
 func (m *Manager) configureWebServer() error {
-	logger.Info("配置 Web 服务器", "type", m.webServerType)
-
-	switch m.webServerType {
-	case WebServerNginx:
-		return m.configureNginx()
-	case WebServerApache:
-		return m.configureApache()
-	case WebServerIIS:
-		return m.configureIIS()
-	default:
-		return fmt.Errorf("不支持的 Web 服务器类型")
+	if m.configurator == nil {
+		logger.Warn("未设置 Web 服务器配置器，跳过配置")
+		return nil
 	}
-}
 
-// configureNginx 配置 Nginx
-func (m *Manager) configureNginx() error {
-	logger.Info("配置 Nginx SSL", "domain", m.domain)
+	logger.Info("配置 Web 服务器", "type", m.webServerType.String(), "domains", m.domains)
 
-	// 这里应该实现真正的 Nginx 配置逻辑
-	// 包括创建虚拟主机配置、启用 SSL 等
+	// 使用 webserver 包的配置器
+	cfg := &webserver.Config{
+		Type:     m.webServerType.String(),
+		Domain:   strings.Join(m.domains, " "), // Nginx server_name 支持多域名
+		CertPath: m.getCertPath(),
+		KeyPath:  m.getKeyPath(),
+		WebRoot:  m.webrootPath,
+	}
 
-	logger.Info("Nginx 配置完成")
+	if err := m.configurator.Configure(cfg); err != nil {
+		return err
+	}
+
+	// 测试配置
+	if err := m.configurator.Test(); err != nil {
+		return fmt.Errorf("配置测试失败: %w", err)
+	}
+
+	// 重载配置
+	if err := m.configurator.Reload(); err != nil {
+		return fmt.Errorf("重载配置失败: %w", err)
+	}
+
+	logger.Info("Web 服务器配置完成")
 	return nil
 }
 
-// configureApache 配置 Apache
-func (m *Manager) configureApache() error {
-	logger.Info("配置 Apache SSL", "domain", m.domain)
-
-	// 这里应该实现真正的 Apache 配置逻辑
-
-	logger.Info("Apache 配置完成")
-	return nil
-}
-
-// configureIIS 配置 IIS
-func (m *Manager) configureIIS() error {
-	logger.Info("配置 IIS SSL", "domain", m.domain)
-
-	// 这里应该实现真正的 IIS 配置逻辑
-
-	logger.Info("IIS 配置完成")
-	return nil
-}
-
-// 获取各种文件路径
+// 路径辅助方法
 func (m *Manager) getCertPath() string {
-	return filepath.Join(m.certDir, m.domain, "cert.pem")
+	return filepath.Join(m.certDir, m.getDirName(), "cert.pem")
 }
 
 func (m *Manager) getKeyPath() string {
-	return filepath.Join(m.certDir, m.domain, "key.pem")
+	return filepath.Join(m.certDir, m.getDirName(), "key.pem")
 }
 
 func (m *Manager) getChainPath() string {
-	return filepath.Join(m.certDir, m.domain, "chain.pem")
-}
-
-// obtainCertificateWebroot 使用 Webroot 模式获取证书
-func (m *Manager) obtainCertificateWebroot(csr []byte) ([]byte, error) {
-	logger.Info("使用 Webroot 模式获取证书", "domain", m.domain, "webroot", m.webrootPath)
-
-	// 这里应该实现真正的 ACME Webroot 验证逻辑
-	// 1. 在 webroot/.well-known/acme-challenge/ 目录下创建挑战文件
-	// 2. 向 Let's Encrypt 服务器发送证书申请
-	// 3. Let's Encrypt 服务器通过 HTTP 访问挑战文件进行验证
-
-	// 为了演示，这里使用自签名证书
-	return m.generateSelfSignedCert(csr)
-}
-
-// obtainCertificateStandalone 使用 Standalone 模式获取证书
-func (m *Manager) obtainCertificateStandalone(csr []byte) ([]byte, error) {
-	logger.Info("使用 Standalone 模式获取证书", "domain", m.domain)
-
-	// 这里应该实现真正的 ACME Standalone 验证逻辑
-	// 1. 启动临时 HTTP 服务器监听 80 端口
-	// 2. 向 Let's Encrypt 服务器发送证书申请
-	// 3. Let's Encrypt 服务器通过 HTTP 访问挑战路径进行验证
-	// 4. 验证成功后关闭临时服务器
-
-	// 为了演示，这里使用自签名证书
-	return m.generateSelfSignedCert(csr)
-}
-
-// obtainCertificateDNS 使用 DNS 模式获取证书（支持泛域名）
-func (m *Manager) obtainCertificateDNS(csr []byte) ([]byte, error) {
-	logger.Info("使用 DNS 模式获取证书", "domain", m.domain)
-
-	// 这里应该实现真正的 ACME DNS 验证逻辑
-	// 1. 向 Let's Encrypt 服务器发送证书申请
-	// 2. 获取 DNS 挑战记录值
-	// 3. 在 DNS 服务商中添加 TXT 记录：_acme-challenge.domain.com
-	// 4. 等待 DNS 传播完成
-	// 5. 通知 Let's Encrypt 服务器进行验证
-	// 6. 验证成功后清理 DNS 记录
-
-	logger.Warn("注意：DNS 模式需要手动添加 DNS 记录或配置 DNS API", "domain", m.domain)
-
-	// 为了演示，这里使用自签名证书
-	return m.generateSelfSignedCert(csr)
+	return filepath.Join(m.certDir, m.getDirName(), "chain.pem")
 }

@@ -80,33 +80,28 @@ func runInstall(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("参数验证失败: %w", err)
 	}
 
-	// 如果只有一个域名，使用单域名管理器
-	if len(domainList) == 1 {
-		return installSingleDomain(domainList[0])
-	} else {
-		// 多域名证书，使用多域名管理器
-		return installMultiDomain(domainList)
-	}
+	// 使用统一的证书管理器
+	return installCertificate(domainList)
 }
 
-// installSingleDomain 安装单域名证书
-func installSingleDomain(domain string) error {
-	logger.Info("安装单域名证书", "domain", domain)
-
-	// 创建证书管理器
-	certManager := cert.NewManager(domain, email)
+// installCertificate 安装证书（统一处理单域名和多域名）
+func installCertificate(domainList []string) error {
+	// 创建统一的证书管理器
+	certManager := cert.NewManagerWithDomains(domainList, email)
+	if certManager == nil {
+		return fmt.Errorf("创建证书管理器失败")
+	}
 
 	// 设置验证模式
-	if dnsChallenge || strings.HasPrefix(domain, "*.") {
+	if dnsChallenge || certManager.HasWildcard() {
 		certManager.SetChallengeType(cert.ChallengeDNS)
-		logger.Info("使用 DNS 验证模式", "domain", domain)
+		logger.Info("使用 DNS 验证模式")
 	} else if standalone {
 		certManager.SetChallengeType(cert.ChallengeStandalone)
 	} else if webroot != "" {
 		certManager.SetChallengeType(cert.ChallengeWebroot)
 		certManager.SetWebrootPath(webroot)
 	} else {
-		// 默认尝试 webroot 模式
 		certManager.SetChallengeType(cert.ChallengeWebroot)
 	}
 
@@ -121,64 +116,16 @@ func installSingleDomain(domain string) error {
 
 	// 申请并安装证书
 	if err := certManager.Install(); err != nil {
-		logger.Error("证书安装失败", "domain", domain, "error", err)
-		return fmt.Errorf("域名 %s 证书安装失败: %w", domain, err)
+		logger.Error("证书安装失败", "domains", domainList, "error", err)
+		return fmt.Errorf("证书安装失败: %w", err)
 	}
 
-	logger.Info("证书安装成功", "domain", domain)
-	fmt.Printf("✓ 域名 %s 证书安装成功\n", domain)
-	return nil
-}
-
-// installMultiDomain 安装多域名证书（SAN证书）
-func installMultiDomain(domains []string) error {
-	logger.Info("安装多域名证书", "domains", domains, "count", len(domains))
-
-	// 创建多域名证书管理器
-	multiManager := cert.NewMultiDomainManager(domains, email)
-	if multiManager == nil {
-		return fmt.Errorf("创建多域名管理器失败")
-	}
-
-	// 设置验证模式
-	hasWildcard := false
-	for _, d := range domains {
-		if strings.HasPrefix(d, "*.") {
-			hasWildcard = true
-			break
-		}
-	}
-
-	if dnsChallenge || hasWildcard {
-		multiManager.SetChallengeType(cert.ChallengeDNS)
-		logger.Info("使用 DNS 验证模式", "reason", "多域名或包含泛域名")
-	} else if standalone {
-		multiManager.SetChallengeType(cert.ChallengeStandalone)
-	} else if webroot != "" {
-		multiManager.SetChallengeType(cert.ChallengeWebroot)
-		multiManager.SetWebrootPath(webroot)
+	logger.Info("证书安装成功", "domains", domainList)
+	if len(domainList) == 1 {
+		fmt.Printf("✓ 域名 %s 证书安装成功\n", domainList[0])
 	} else {
-		// 默认尝试 webroot 模式
-		multiManager.SetChallengeType(cert.ChallengeWebroot)
+		fmt.Printf("✓ 多域名证书安装成功，包含 %d 个域名: %s\n", len(domainList), strings.Join(domainList, ", "))
 	}
-
-	// 设置 Web 服务器类型
-	if nginx {
-		multiManager.SetWebServer(cert.WebServerNginx)
-	} else if apache {
-		multiManager.SetWebServer(cert.WebServerApache)
-	} else if iis {
-		multiManager.SetWebServer(cert.WebServerIIS)
-	}
-
-	// 申请并安装多域名证书
-	if err := multiManager.Install(); err != nil {
-		logger.Error("多域名证书安装失败", "domains", domains, "error", err)
-		return fmt.Errorf("多域名证书安装失败: %w", err)
-	}
-
-	logger.Info("多域名证书安装成功", "domains", domains)
-	fmt.Printf("✓ 多域名证书安装成功，包含 %d 个域名: %s\n", len(domains), strings.Join(domains, ", "))
 	return nil
 }
 

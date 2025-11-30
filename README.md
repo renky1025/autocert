@@ -4,6 +4,60 @@
 
 AutoCert 是一个跨平台的 Let's Encrypt HTTPS 证书管理工具，支持一键安装、自动更新、跨机器迁移等功能，简化 SSL/TLS 证书的部署和管理流程。
 
+## 🏗️ 项目架构
+
+### 工作原理
+
+```
+┌─────────────┐     ┌─────────────┐     ┌─────────────┐     ┌─────────────┐
+│   CLI 命令   │ ──▶ │  证书管理器  │ ──▶ │  ACME 验证  │ ──▶ │ Web服务器配置│
+│  (Cobra)    │     │  (Manager)  │     │ (Challenge) │     │(Configurator)│
+└─────────────┘     └─────────────┘     └─────────────┘     └─────────────┘
+```
+
+**核心流程**：
+1. **CLI 解析** → `cmd/` 使用 Cobra 处理用户命令
+2. **证书申请** → `internal/cert/` 生成 CSR，执行 ACME 验证
+3. **验证模式** → Webroot / Standalone / DNS 三种挑战方式
+4. **服务器配置** → `internal/webserver/` 自动配置 Nginx/Apache/IIS
+
+### 目录结构
+
+```
+autocert/
+├── main.go                 # 程序入口
+├── cmd/                    # CLI 命令定义
+│   ├── root.go            # 根命令和全局配置
+│   ├── install.go         # 安装证书命令
+│   ├── manage.go          # 续期/状态/定时任务
+│   ├── backup.go          # 导出/导入命令
+│   └── version.go         # 版本信息
+├── internal/              # 内部模块
+│   ├── cert/              # 证书管理核心
+│   │   └── manager.go     # 统一证书管理器
+│   ├── webserver/         # Web 服务器配置器
+│   │   └── configurator.go
+│   ├── config/            # 配置文件管理
+│   ├── logger/            # 日志模块
+│   ├── scheduler/         # 定时任务调度
+│   └── backup/            # 备份恢复功能
+├── scripts/               # 安装和打包脚本
+│   ├── install.sh         # Linux/macOS 安装脚本
+│   ├── install.ps1        # Windows 安装脚本
+│   ├── package.sh         # Linux/macOS 打包脚本
+│   └── package.ps1        # Windows 打包脚本
+└── docs/                  # 文档目录
+```
+
+### 核心依赖
+
+| 依赖 | 版本 | 用途 |
+|------|------|------|
+| `github.com/spf13/cobra` | v1.8.0 | CLI 命令框架 |
+| `github.com/spf13/viper` | v1.18.2 | 配置文件管理 |
+| `github.com/sirupsen/logrus` | v1.9.3 | 结构化日志 |
+| `github.com/go-acme/lego` | v4.x | ACME 协议实现 |
+
 ## ✨ 特性
 
 - 🚀 **一键安装** - 只需运行一个命令即可完成证书申请与安装
