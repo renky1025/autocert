@@ -3,7 +3,11 @@ package cmd
 import (
 	"autocert/internal/cert"
 	"autocert/internal/logger"
+	"autocert/internal/scheduler"
+	"autocert/internal/system"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -22,13 +26,13 @@ var installCmd = &cobra.Command{
   autocert install --domains "example.com,www.example.com,api.example.com" --email admin@example.com --nginx
   
   # 泛域名证书（需要DNS验证）
-  autocert install --domain "*.example.com" --email admin@example.com --nginx --dns
+  autocert install --domain "*.example.com" --email admin@example.com --nginx --dns --skip-schedule
   
   # 二级域名
   autocert install --domain sub.example.com --email admin@example.com --nginx
   
   # 混合域名（主域名+泛域名）
-  autocert install --domains "example.com,*.example.com" --email admin@example.com --nginx --dns`,
+  autocert install --domains "example.com,*.example.com" --email admin@example.com --nginx --dns --skip-schedule`,
 	RunE: runInstall,
 }
 
@@ -39,6 +43,7 @@ var (
 	webroot      string
 	standalone   bool
 	dnsChallenge bool // DNS 验证模式
+	skipSchedule bool
 	nginx        bool
 	apache       bool
 	iis          bool
@@ -56,6 +61,7 @@ func init() {
 	installCmd.Flags().StringVarP(&webroot, "webroot", "w", "", "Webroot 模式的网站根目录路径")
 	installCmd.Flags().BoolVar(&standalone, "standalone", false, "使用 Standalone 模式验证")
 	installCmd.Flags().BoolVar(&dnsChallenge, "dns", false, "使用 DNS 验证模式（泛域名证书必需）")
+	installCmd.Flags().BoolVar(&skipSchedule, "skip-schedule", false, "安装完成后不自动创建续期任务")
 
 	// Web 服务器类型
 	installCmd.Flags().BoolVar(&nginx, "nginx", false, "配置 Nginx")
@@ -118,6 +124,12 @@ func installCertificate(domainList []string) error {
 	if err := certManager.Install(); err != nil {
 		logger.Error("证书安装失败", "domains", domainList, "error", err)
 		return fmt.Errorf("证书安装失败: %w", err)
+	}
+
+	if !skipSchedule {
+		if err := installRenewSchedule("autocert-renew"); err != nil {
+			return fmt.Errorf("证书安装完成，但创建自动续期任务失败: %w", err)
+		}
 	}
 
 	logger.Info("证书安装成功", "domains", domainList)
@@ -187,6 +199,10 @@ func validateDomainName(domain string) error {
 }
 
 func validateInstallFlags(domainList []string) error {
+	if err := autoDetectInstallFlags(domainList); err != nil {
+		return err
+	}
+
 	// 验证至少指定了一种 Web 服务器
 	if !nginx && !apache && !iis {
 		return fmt.Errorf("必须指定至少一种 Web 服务器类型: --nginx, --apache, 或 --iis")
@@ -219,6 +235,9 @@ func validateInstallFlags(domainList []string) error {
 	if hasWildcard && !dnsChallenge {
 		return fmt.Errorf("泛域名证书必须使用 DNS 验证模式，请添加 --dns 参数")
 	}
+	if hasWildcard && !skipSchedule {
+		return fmt.Errorf("泛域名证书当前只支持手动 DNS 验证，请使用 --skip-schedule 安装，自动续期请改用 HTTP-01/webroot")
+	}
 
 	// 验证验证模式不能同时指定多个
 	challengeCount := 0
@@ -235,6 +254,96 @@ func validateInstallFlags(domainList []string) error {
 	if challengeCount > 1 {
 		return fmt.Errorf("只能指定一种验证模式: --standalone, --webroot, 或 --dns")
 	}
+	if dnsChallenge && !skipSchedule {
+		return fmt.Errorf("DNS 验证当前不支持无人值守自动续期，请使用 --skip-schedule，或改用 HTTP-01/webroot")
+	}
+	if !dnsChallenge && !standalone && webroot == "" {
+		return fmt.Errorf("HTTP-01 一键配置需要网站根目录，请使用 --webroot 指定")
+	}
+	if standalone && !skipSchedule {
+		return fmt.Errorf("Standalone 验证不适合无人值守自动续期，请改用 --webroot，或使用 --skip-schedule")
+	}
 
 	return nil
+}
+
+func autoDetectInstallFlags(domainList []string) error {
+	for _, item := range domainList {
+		if strings.HasPrefix(item, "*.") {
+			dnsChallenge = true
+			break
+		}
+	}
+
+	if !nginx && !apache && !iis {
+		info, err := system.DetectSystem()
+		if err != nil {
+			return nil
+		}
+
+		for _, server := range info.WebServers {
+			switch server.Type {
+			case "nginx":
+				nginx = true
+			case "apache":
+				apache = true
+			case "iis":
+				iis = true
+			}
+
+			if nginx || apache || iis {
+				logger.Info("自动检测到 Web 服务器", "type", server.Type, "configPath", server.ConfigPath)
+				break
+			}
+		}
+	}
+
+	if webroot == "" && !dnsChallenge && !standalone {
+		webroot = guessWebroot(domainList)
+		if webroot != "" {
+			logger.Info("自动检测到网站根目录", "webroot", webroot)
+		}
+	}
+
+	return nil
+}
+
+func guessWebroot(domainList []string) string {
+	candidates := []string{}
+	if iis {
+		candidates = append(candidates, `C:\inetpub\wwwroot`)
+	}
+	for _, domain := range domainList {
+		base := filepath.Join("/var/www", domain)
+		candidates = append(candidates,
+			base,
+			filepath.Join(base, "html"),
+			filepath.Join("/usr/share/nginx/html"),
+			filepath.Join("/var/www/html"),
+		)
+	}
+
+	seen := map[string]bool{}
+	for _, candidate := range candidates {
+		candidate = filepath.Clean(candidate)
+		if seen[candidate] {
+			continue
+		}
+		seen[candidate] = true
+		if stat, err := os.Stat(candidate); err == nil && stat.IsDir() {
+			return candidate
+		}
+	}
+
+	return ""
+}
+
+func installRenewSchedule(taskName string) error {
+	execPath, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("获取执行文件路径失败: %w", err)
+	}
+
+	sched := scheduler.NewScheduler()
+	return sched.Install(taskName, execPath, "0 2 * * *")
 }

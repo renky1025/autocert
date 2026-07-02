@@ -181,7 +181,9 @@ autocert install --domains "example.com,www.example.com,api.example.com" --email
     ├── cert.pem      # 多域名证书文件
     ├── key.pem       # 私钥文件
     ├── chain.pem     # 证书链文件
-    └── domains.txt   # 包含的域名列表
+    ├── fullchain.pem # 完整证书链
+    ├── cert.json     # 证书元数据
+    └── site.json     # 托管站点配置
 ```
 
 ### 泛域名证书
@@ -195,7 +197,7 @@ autocert install --domains "example.com,www.example.com,api.example.com" --email
 
 ## 🔄 证书续期
 
-所有类型的证书都支持自动续期：
+只有基于 HTTP-01/webroot 托管的证书支持无人值守自动续期。DNS 验证证书仍可手动续期：
 
 ```bash
 # 续期特定域名
@@ -227,7 +229,8 @@ autocert renew --all
 ### 3. 证书管理
 
 **建议**：
-- 设置自动续期任务
+- Webroot 站点保持续期任务开启
+- DNS 验证证书预留人工续期窗口
 - 定期备份证书文件
 - 监控证书过期时间
 
@@ -235,6 +238,7 @@ autocert renew --all
 
 ### 1. 泛域名限制
 - 泛域名证书只能使用 DNS 验证
+- 当前 DNS 验证需要人工完成 TXT 记录校验，因此不会加入无人值守自动续期
 - 泛域名不包含主域名本身（`*.example.com` 不包含 `example.com`）
 - 如需同时支持主域名和子域名，请使用混合证书
 

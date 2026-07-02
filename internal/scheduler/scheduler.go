@@ -181,7 +181,7 @@ func (w *WindowsScheduler) generateTaskXML(taskName, command, schedule string) (
   <Actions Context="Author">
     <Exec>
       <Command>{{.Command}}</Command>
-      <Arguments>renew --all</Arguments>
+      <Arguments>renew</Arguments>
     </Exec>
   </Actions>
 </Task>`
@@ -266,7 +266,7 @@ After=network.target
 
 [Service]
 Type=oneshot
-ExecStart=%s renew --all
+ExecStart=%s renew
 User=root
 `, taskName, command)
 
@@ -371,7 +371,7 @@ func (l *LinuxScheduler) installCronJob(taskName, command, schedule string) erro
 	currentCrontab, _ := cmd.Output()
 
 	// 添加新任务
-	cronEntry := fmt.Sprintf("%s %s renew --all # %s\n", schedule, command, taskName)
+	cronEntry := fmt.Sprintf("%s %s renew # %s\n", schedule, command, taskName)
 	newCrontab := string(currentCrontab) + cronEntry
 
 	// 写入新的 crontab

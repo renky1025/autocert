@@ -15,9 +15,11 @@ import (
 
 	"github.com/go-acme/lego/v4/certcrypto"
 	"github.com/go-acme/lego/v4/certificate"
+	"github.com/go-acme/lego/v4/challenge/dns01"
 	"github.com/go-acme/lego/v4/challenge/http01"
 	"github.com/go-acme/lego/v4/challenge/tlsalpn01"
 	"github.com/go-acme/lego/v4/lego"
+	"github.com/go-acme/lego/v4/providers/http/webroot"
 	"github.com/go-acme/lego/v4/registration"
 )
 
@@ -56,6 +58,7 @@ type Client struct {
 	configDir string
 	staging   bool // 是否使用测试环境
 	webroot   string
+	dnsName   string
 	httpPort  string
 	tlsPort   string
 }
@@ -66,6 +69,7 @@ type ClientConfig struct {
 	ConfigDir string
 	Staging   bool   // 使用 Let's Encrypt 测试环境
 	Webroot   string // Webroot 路径
+	DNSName   string // lego DNS provider 名称
 	HTTPPort  string // HTTP 挑战端口
 	TLSPort   string // TLS-ALPN 挑战端口
 }
@@ -80,6 +84,7 @@ func NewClient(cfg *ClientConfig) (*Client, error) {
 		configDir: cfg.ConfigDir,
 		staging:   cfg.Staging,
 		webroot:   cfg.Webroot,
+		dnsName:   cfg.DNSName,
 		httpPort:  cfg.HTTPPort,
 		tlsPort:   cfg.TLSPort,
 	}
@@ -134,9 +139,10 @@ func NewClient(cfg *ClientConfig) (*Client, error) {
 // SetHTTPChallenge 设置 HTTP-01 挑战
 func (c *Client) SetHTTPChallenge() error {
 	if c.webroot != "" {
-		// 使用 webroot 模式
-		provider := http01.NewProviderServer("", c.httpPort)
-		// 注意：lego 的 webroot provider 需要额外配置
+		provider, err := webroot.NewHTTPProvider(c.webroot)
+		if err != nil {
+			return fmt.Errorf("创建 webroot HTTP 验证器失败: %w", err)
+		}
 		return c.client.Challenge.SetHTTP01Provider(provider)
 	}
 
@@ -146,6 +152,20 @@ func (c *Client) SetHTTPChallenge() error {
 		port = "80"
 	}
 	return c.client.Challenge.SetHTTP01Provider(http01.NewProviderServer("", port))
+}
+
+// SetDNSChallenge 设置 DNS-01 挑战。
+func (c *Client) SetDNSChallenge() error {
+	if c.dnsName != "" {
+		return fmt.Errorf("当前版本未内置 DNS provider %q 的自动化接入，请改用手动 DNS 验证", c.dnsName)
+	}
+
+	provider, err := dns01.NewDNSProviderManual()
+	if err != nil {
+		return fmt.Errorf("创建手动 DNS 验证器失败: %w", err)
+	}
+
+	return c.client.Challenge.SetDNS01Provider(provider)
 }
 
 // SetTLSChallenge 设置 TLS-ALPN-01 挑战

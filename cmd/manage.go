@@ -6,6 +6,7 @@ import (
 	"autocert/internal/scheduler"
 	"fmt"
 	"os"
+	"strings"
 	"text/tabwriter"
 
 	"github.com/spf13/cobra"
@@ -119,19 +120,7 @@ func runStatus(cmd *cobra.Command, args []string) error {
 
 func runScheduleInstall(cmd *cobra.Command, args []string) error {
 	logger.Info("安装定时任务", "taskName", taskName)
-
-	// 获取当前执行文件路径
-	execPath, err := os.Executable()
-	if err != nil {
-		return fmt.Errorf("获取执行文件路径失败: %w", err)
-	}
-
-	// 创建调度器
-	sched := scheduler.NewScheduler()
-
-	// 安装任务（每日凌晨2点检查）
-	schedule := "0 2 * * *" // cron 格式
-	if err := sched.Install(taskName, execPath, schedule); err != nil {
+	if err := installRenewSchedule(taskName); err != nil {
 		return fmt.Errorf("安装定时任务失败: %w", err)
 	}
 
@@ -187,14 +176,21 @@ func runScheduleList(cmd *cobra.Command, args []string) error {
 }
 
 func renewDomainCert(domain string) error {
-	// 创建证书管理器
-	certManager := cert.NewManager(domain, "")
-	if certManager == nil {
-		return fmt.Errorf("创建证书管理器失败")
+	spec, err := cert.LoadSiteSpec(domain)
+	if err != nil {
+		return err
+	}
+	if !renewAll && !spec.SupportsAutoRenewal() {
+		return fmt.Errorf("域名 %s 当前不是无人值守续期站点，请手动执行 DNS 验证或重新用 webroot 方式安装", domain)
+	}
+
+	certManager, err := cert.NewManagerFromSiteSpec(spec)
+	if err != nil {
+		return fmt.Errorf("创建证书管理器失败: %w", err)
 	}
 
 	// 续期证书
-	if err := certManager.Renew(); err != nil {
+	if err := certManager.Renew(renewAll); err != nil {
 		return fmt.Errorf("域名 %s 证书续期失败: %w", domain, err)
 	}
 
@@ -203,19 +199,53 @@ func renewDomainCert(domain string) error {
 }
 
 func renewAllCerts() error {
-	// 这里应该遍历所有已安装的证书进行续期
-	// 为简化演示，这里只是打印消息
-
 	logger.Info("开始续期所有证书")
+
+	specs, err := cert.ListSiteSpecs()
+	if err != nil {
+		return err
+	}
+	if len(specs) == 0 {
+		fmt.Println("没有找到已托管的证书站点")
+		return nil
+	}
+
+	var failed []string
+	for _, spec := range specs {
+		if !renewAll && !spec.SupportsAutoRenewal() {
+			logger.Warn("跳过无法自动续期的站点", "domain", spec.PrimaryDomain(), "challenge", spec.Challenge)
+			continue
+		}
+
+		manager, err := cert.NewManagerFromSiteSpec(spec)
+		if err != nil {
+			failed = append(failed, fmt.Sprintf("%s: %v", spec.PrimaryDomain(), err))
+			continue
+		}
+		if err := manager.Renew(renewAll); err != nil {
+			failed = append(failed, fmt.Sprintf("%s: %v", spec.PrimaryDomain(), err))
+			continue
+		}
+		fmt.Printf("✓ 域名 %s 续期检查完成\n", spec.PrimaryDomain())
+	}
+
+	if len(failed) > 0 {
+		return fmt.Errorf("以下站点续期失败: %s", strings.Join(failed, "; "))
+	}
+
 	fmt.Println("✓ 所有证书续期检查完成")
 	return nil
 }
 
 func showDomainStatus(domain string) error {
-	// 创建证书管理器
-	certManager := cert.NewManager(domain, "")
-	if certManager == nil {
-		return fmt.Errorf("创建证书管理器失败")
+	spec, err := cert.LoadSiteSpec(domain)
+	if err != nil {
+		return err
+	}
+
+	certManager, err := cert.NewManagerFromSiteSpec(spec)
+	if err != nil {
+		return fmt.Errorf("创建证书管理器失败: %w", err)
 	}
 
 	// 获取证书信息
@@ -228,6 +258,22 @@ func showDomainStatus(domain string) error {
 	fmt.Printf("域名: %s\n", certInfo.Domain)
 	if len(certInfo.Domains) > 1 {
 		fmt.Printf("所有域名: %v\n", certInfo.Domains)
+	}
+	fmt.Printf("验证方式: %s\n", spec.Challenge)
+	if spec.WebServer != "" {
+		fmt.Printf("Web 服务器: %s\n", spec.WebServer)
+	}
+	if spec.WebrootPath != "" {
+		fmt.Printf("WebRoot: %s\n", spec.WebrootPath)
+	}
+	if spec.DNSProvider != "" {
+		fmt.Printf("DNS Provider: %s\n", spec.DNSProvider)
+	}
+	fmt.Printf("自动续期: ")
+	if spec.SupportsAutoRenewal() {
+		fmt.Printf("✓ 支持\n")
+	} else {
+		fmt.Printf("✗ 不支持（需要人工参与验证）\n")
 	}
 	fmt.Printf("证书路径: %s\n", certInfo.CertPath)
 	fmt.Printf("私钥路径: %s\n", certInfo.KeyPath)
@@ -244,15 +290,49 @@ func showDomainStatus(domain string) error {
 }
 
 func showAllStatus() error {
-	// 这里应该遍历所有已安装的证书显示状态
-	// 为简化演示，这里只是显示表头
+	specs, err := cert.ListSiteSpecs()
+	if err != nil {
+		return err
+	}
+	if len(specs) == 0 {
+		fmt.Println("没有找到已托管的证书站点")
+		return nil
+	}
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "域名\t状态\t到期时间\t剩余天数")
-	fmt.Fprintln(w, "----\t----\t--------\t--------")
+	fmt.Fprintln(w, "域名\t状态\t验证方式\t自动续期\t到期时间\t剩余天数")
+	fmt.Fprintln(w, "----\t----\t--------\t--------\t--------\t--------")
 
-	// 这里应该有实际的证书信息
-	fmt.Fprintln(w, "example.com\t有效\t2024-12-31\t30天")
+	for _, spec := range specs {
+		manager, err := cert.NewManagerFromSiteSpec(spec)
+		if err != nil {
+			fmt.Fprintf(w, "%s\t错误\t%s\t-\t-\t-\n", spec.PrimaryDomain(), spec.Challenge)
+			continue
+		}
+
+		certInfo, err := manager.GetCertInfo()
+		if err != nil {
+			fmt.Fprintf(w, "%s\t缺失\t%s\t-\t-\t-\n", spec.PrimaryDomain(), spec.Challenge)
+			continue
+		}
+
+		status := "有效"
+		if !certInfo.IsValid {
+			status = "已过期"
+		}
+		autoRenew := "否"
+		if spec.SupportsAutoRenewal() {
+			autoRenew = "是"
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%d天\n",
+			spec.PrimaryDomain(),
+			status,
+			spec.Challenge,
+			autoRenew,
+			certInfo.ExpiryDate.Format("2006-01-02"),
+			certInfo.DaysLeft,
+		)
+	}
 
 	w.Flush()
 	return nil
