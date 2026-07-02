@@ -68,7 +68,7 @@ get_build_flags() {
     local build_time=$(date -u '+%Y-%m-%d_%H:%M:%S')
     local commit_hash=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
     
-    echo "-ldflags \"-X main.version=${VERSION} -X main.buildTime=${build_time} -X main.commitHash=${commit_hash}\""
+    echo "-X main.version=${VERSION} -X main.buildTime=${build_time} -X main.commitHash=${commit_hash}"
 }
 
 # 构建二进制文件
@@ -76,11 +76,11 @@ build_binary() {
     local goos=$1
     local goarch=$2
     local output_path=$3
-    local build_flags=$4
+    local ldflags=$4
     
     log_info "构建 ${goos}/${goarch}..."
     
-    GOOS=${goos} GOARCH=${goarch} go build ${build_flags} -o "${output_path}" .
+    GOOS=${goos} GOARCH=${goarch} go build -ldflags "${ldflags}" -o "${output_path}" .
     
     if [ $? -eq 0 ]; then
         log_info "构建成功: ${output_path}"
